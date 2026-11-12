@@ -28,7 +28,8 @@ public partial class App : Application
             services.AddHttpClient("GitHub-OfficialSwitchMods", client =>
             {
                 //client.BaseAddress = new Uri("https://github.com/yuzu-emu/yuzu/wiki/Switch-Mods/");
-                client.BaseAddress = new Uri("https://git.h3cjp.net/H3cJP/yuzu/wiki/Switch-Mods");      // forked 
+                //client.BaseAddress = new Uri("https://git.h3cjp.net/H3cJP/yuzu/wiki/Switch-Mods");      // forked: links point to expired Discord attachments
+                client.BaseAddress = new Uri("https://raw.githubusercontent.com/yuzu-mirror/yuzu-mod-archive/main/README.md");
                 client.DefaultRequestHeaders.Add("user-agent", "request");
             });
 

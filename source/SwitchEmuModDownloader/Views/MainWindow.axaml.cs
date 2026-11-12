@@ -27,8 +27,8 @@ public partial class MainWindow : Window
 
     public async void Window_LoadedAsync(object sender, RoutedEventArgs e)
     {
-        // check app is latest 
-        await CheckAppVersionAsync();
+        // upstream version check disabled in this fork (it points to the original, unmaintained release)
+        await Task.CompletedTask;
 
         // if app is latest, unlock controls 
         ToggleUiControls(true);

@@ -43,10 +43,9 @@
       <StackPanel>
         <Label>Download Server:</Label>
         <ComboBox Name="CboModRepos" ToolTip.Tip="Available repositories to download Mods" SelectedIndex="0" HorizontalAlignment="Stretch">
-          <ComboBoxItem>Official Switch-Mods Repo</ComboBoxItem>
+          <ComboBoxItem>Official Switch-Mods Repo (yuzu-mirror)</ComboBoxItem>
           <ComboBoxItem>TheBoy181 Repo</ComboBoxItem>
           <ComboBoxItem>HolographicWings TOTK Repo</ComboBoxItem>
-          <ComboBoxItem>LexouilleTM Repo (Switch-Mods Repo Alternative)</ComboBoxItem>
         </ComboBox>
       </StackPanel>
     </Border>

@@ -1,5 +1,5 @@
-﻿using HtmlAgilityPack;
 using SwitchEmuModDownloader.Classes.Entities;
+using System.Text.RegularExpressions;
 using System.Xml;
 
 namespace SwitchEmuModDownloader.Classes.Downloaders;
@@ -9,10 +9,7 @@ public sealed class OfficialSwitchModDownloader(IHttpClientFactory clientFactory
     private const string Quote = "\"";
     private const string GameTitleIDsXml = "GameTitleIDs.xml";
     private readonly IHttpClientFactory _clientFactory = clientFactory;
-    private readonly HtmlDocument _htmlDoc = new()
-    {
-        DisableServerSideCode = true
-    };
+    private string _modsPage = "";
 
     public override async Task DownloadPrerequisitesAsync()
     {
@@ -57,13 +54,16 @@ public sealed class OfficialSwitchModDownloader(IHttpClientFactory clientFactory
                     if (string.IsNullOrWhiteSpace(titleId) || !Directory.Exists(Path.Combine(ModDirectoryPath, titleId)))
                         break;
 
-                    games.Add(new()
+                    var game = new Game
                     {
                         TitleID = titleId,
                         TitleName = titleName,
                         ModDataLocation = Path.Combine(ModDirectoryPath, titleId),
                         ModDownloadUrls = GetModDownloadUrls(titleName)   // detect urls for each game and populate the downloads 
-                    });
+                    };
+                    if (game.ModDownloadUrls.Count == 0)
+                        game.Problems.Add("No mods for this game in the yuzu-mirror archive");
+                    games.Add(game);
                     break;
                 default:
                     continue;   //do nothing      
@@ -75,35 +75,51 @@ public sealed class OfficialSwitchModDownloader(IHttpClientFactory clientFactory
     }
 
     /// <summary>
-    /// Downloads the BaseModsRepoUrl and preloads it into memory 
+    /// Downloads the mods page (README.md of yuzu-mirror/yuzu-mod-archive) once.
+    /// It is the old yuzu "Switch-Mods" wiki page with every link rewritten to the mirror.
     /// </summary>
-    /// <returns></returns>
     private async Task DownloadHtmlDocumentAsync()
     {
-        // download the basemodsrepo document once 
         using var client = _clientFactory.CreateClient("GitHub-OfficialSwitchMods");
-        var html = await client.GetStringAsync("").ConfigureAwait(false);
-        _htmlDoc.LoadHtml(html);
+        _modsPage = await client.GetStringAsync("").ConfigureAwait(false);
     }
 
     /// <summary>
-    /// Retrieves all of the download URLs for a specific title.
+    /// Retrieves all of the download URLs for a specific title from the markdown page:
+    /// the table that follows the "### {titleName}" heading.
     /// </summary>
-    /// <param name="titleName">Title of the game.</param>
-    /// <returns>List of Uri's containing the Urls to Mods.</returns>
     private List<Uri> GetModDownloadUrls(string titleName)
     {
-        // read switch-mods downloaded webpage and get download links for current game
-        var nodes = _htmlDoc.DocumentNode.SelectNodes($"//h3[contains(., {Quote}{titleName}{Quote})]/following::table[1]//td//a");
+        var urls = new List<Uri>();
+        bool inSection = false;
 
-        // process links and add them into downloadUrls list 
-        return nodes?
-            .Select(node => node.Attributes["href"].Value.Trim())
-            .Where(url => url.EndsWith(".zip", StringComparison.OrdinalIgnoreCase)
-                       || url.EndsWith(".rar", StringComparison.OrdinalIgnoreCase)
-                       || url.EndsWith(".7z", StringComparison.OrdinalIgnoreCase))
-            .Select(url => new Uri(url))
-            .ToList() ?? [];
+        foreach (string rawLine in _modsPage.Split('\n'))
+        {
+            string line = rawLine.Trim();
+            if (line.StartsWith("### ", StringComparison.Ordinal))
+            {
+                // same rule as before ("heading contains the title"), but exact match first
+                string heading = line[4..].Trim();
+                inSection = heading.Equals(titleName, StringComparison.OrdinalIgnoreCase);
+                continue;
+            }
+
+            if (!inSection || !line.StartsWith('|'))
+                continue;
+
+            foreach (Match m in Regex.Matches(line, @"\]\((?<url>https?://[^)\s]+)\)"))
+            {
+                string url = m.Groups["url"].Value.Trim();
+                if (url.EndsWith(".zip", StringComparison.OrdinalIgnoreCase)
+                    || url.EndsWith(".rar", StringComparison.OrdinalIgnoreCase)
+                    || url.EndsWith(".7z", StringComparison.OrdinalIgnoreCase))
+                {
+                    urls.Add(new Uri(url));
+                }
+            }
+        }
+
+        return urls;
     }
 
     private static void CleanUp()

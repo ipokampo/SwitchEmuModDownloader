@@ -1,8 +1,9 @@
-﻿using SwitchEmuModDownloader.Classes.Downloaders.Interfaces;
+using SwitchEmuModDownloader.Classes.Downloaders.Interfaces;
 using SwitchEmuModDownloader.Classes.Entities;
 using SwitchEmuModDownloader.Classes.Extensions;
 using System.Diagnostics;
 using System.IO.Compression;
+using SwitchEmuModDownloader.Classes.Utilities;
 
 namespace SwitchEmuModDownloader.Classes.Downloaders;
 
@@ -72,54 +73,123 @@ public abstract class ModDownloader : IModDownloader
     {
         var client = _clientFactory.CreateClient();
         const FileOptions fileOptions = FileOptions.Asynchronous | FileOptions.SequentialScan;
-        foreach (var game in games)
+        string workRoot = Path.Combine(Path.GetTempPath(), "SwitchEmuModDownloader", Guid.NewGuid().ToString("N"));
+
+        try
         {
-            // clear mod data location if user has checked the option 
-            if (_isModDataLocationToBeDeleted)
+            foreach (var game in games)
             {
-                DeleteModDataLocationPath(game.ModDataLocation);
-            }
+                // download every archive of this game into a temp folder first:
+                // nothing touches the Mod Data Location until we know what we got
+                string gameWork = Path.Combine(workRoot, game.TitleID);
+                Directory.CreateDirectory(gameWork);
+                var downloaded = new List<string>();
 
-            foreach (var url in game.ModDownloadUrls)
-            {
-                // download each mod url 
-                string fileName = url.AbsoluteUri[(url.AbsoluteUri.LastIndexOf('/') + 1)..].Trim();
-                string downloadedFilePath = Path.Combine(game.ModDataLocation, fileName);
-                await using (var file = new FileStream(downloadedFilePath, FileMode.Create, FileAccess.Write, FileShare.None, 8192, fileOptions))
+                foreach (var url in game.ModDownloadUrls)
                 {
-                    var progressReporter = new Progress<float>(progress => OnProgressChanged((int)(progress * 100), $"Downloading {fileName} ..."));
-                    await client.DownloadAsync(url.AbsoluteUri, file, progressReporter);
-                }
-
-                // if file has been downloaded, unpack it
-                // otherwise skip 
-                if (new FileInfo(downloadedFilePath) is { Exists: true, Length: > 0 })
-                {
-                    // file has been downloaded, unpack it 
-                    OnProgressChanged(0, $"Unpacking {fileName} ...");
-                    var psi = new ProcessStartInfo
+                    string fileName = Uri.UnescapeDataString(url.AbsoluteUri[(url.AbsoluteUri.LastIndexOf('/') + 1)..].Trim());
+                    string downloadedFilePath = Path.Combine(gameWork, fileName);
+                    string? error;
+                    await using (var file = new FileStream(downloadedFilePath, FileMode.Create, FileAccess.Write, FileShare.None, 8192, fileOptions))
                     {
-                        UseShellExecute = true,
-                        CreateNoWindow = true,
-                        WindowStyle = ProcessWindowStyle.Hidden,
-                        FileName = _sevenZipExePath,
-                        Arguments = $"x {Quote}{downloadedFilePath}{Quote} -o{Quote}{game.ModDataLocation}{Quote} -aoa"
-                    };
+                        var progressReporter = new Progress<float>(progress => OnProgressChanged((int)(progress * 100), $"Downloading {fileName} ..."));
+                        error = await client.DownloadAsync(url.AbsoluteUri, file, progressReporter);
+                    }
 
-                    using var p = Process.Start(psi)!;
-                    await p.WaitForExitAsync();
-                    OnProgressChanged(100, $"Unpacking {fileName} ...");
+                    if (error is null && new FileInfo(downloadedFilePath).Length > 0)
+                    {
+                        downloaded.Add(downloadedFilePath);
+                    }
+                    else
+                    {
+                        game.Problems.Add($"Download failed: {fileName} ({error ?? "empty file"}) - {url.AbsoluteUri}");
+                        OnProgressChanged(100, $"Download failed: {fileName}");
+                    }
                 }
-                else
+
+                // "Clear Mod Data Location" only if we actually have something to replace it with
+                if (_isModDataLocationToBeDeleted && downloaded.Count > 0)
                 {
-                    OnProgressChanged(100, $"Skipping {fileName} ...");
+                    DeleteModDataLocationPath(game.ModDataLocation);
+                }
+
+                foreach (string archive in downloaded)
+                {
+                    await UnpackIntoModDataLocationAsync(game, archive);
+                }
+
+                // keep the archive copies next to the mods only if the user asked to keep them
+                if (!_isDownloadedModArchivesToBeDeleted)
+                {
+                    foreach (string archive in downloaded)
+                    {
+                        string target = Path.Combine(game.ModDataLocation, Path.GetFileName(archive));
+                        if (!File.Exists(target))
+                            File.Copy(archive, target);
+                    }
                 }
             }
         }
-
-        if (_isDownloadedModArchivesToBeDeleted)
+        finally
         {
-            DeleteDownloadedModArchiveFiles();
+            try { Directory.Delete(workRoot, true); } catch { }
+        }
+    }
+
+    /// <summary>
+    /// Unpacks an archive into a staging folder and moves each mod folder into the game's
+    /// Mod Data Location. Existing mod folders are never overwritten.
+    /// </summary>
+    private async Task UnpackIntoModDataLocationAsync(Game game, string archivePath)
+    {
+        string fileName = Path.GetFileName(archivePath);
+        string staging = Path.Combine(Path.GetDirectoryName(archivePath)!, "x_" + Path.GetFileNameWithoutExtension(archivePath));
+        Directory.CreateDirectory(staging);
+
+        OnProgressChanged(0, $"Unpacking {fileName} ...");
+        var psi = new ProcessStartInfo
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            WindowStyle = ProcessWindowStyle.Hidden,
+            FileName = _sevenZipExePath,
+            Arguments = $"x {Quote}{archivePath}{Quote} -o{Quote}{staging}{Quote} -y"
+        };
+
+        using (var p = Process.Start(psi)!)
+        {
+            await p.WaitForExitAsync();
+            if (p.ExitCode > 1)     // 0 = OK, 1 = warnings
+            {
+                game.Problems.Add($"Unpacking failed: {fileName} (7-Zip exit code {p.ExitCode})");
+                return;
+            }
+        }
+        OnProgressChanged(100, $"Unpacking {fileName} ...");
+
+        // an archive that has romfs/exefs/cheats at its root is a single mod without its own folder:
+        // wrap it in a folder named after the archive so yuzu can see it
+        string[] modContentFolders = ["romfs", "exefs", "romfs_ext", "exefs_ext", "cheats"];
+        bool isBareMod = Directory.GetDirectories(staging)
+            .Select(d => Path.GetFileName(d))
+            .Any(d => modContentFolders.Contains(d, StringComparer.OrdinalIgnoreCase));
+
+        List<(string Source, string Name)> entries = isBareMod
+            ? [(staging, Path.GetFileNameWithoutExtension(archivePath))]
+            : Directory.GetDirectories(staging).Select(d => (d, Path.GetFileName(d))).ToList();   // loose files (readmes...) are not copied
+
+        Directory.CreateDirectory(game.ModDataLocation);
+        foreach (var (source, name) in entries)
+        {
+            string target = Path.Combine(game.ModDataLocation, name);
+            if (Directory.Exists(target) || File.Exists(target))
+            {
+                game.SkippedMods.Add(name);
+                continue;
+            }
+
+            DirectoryUtilities.CopyAllFiles(source, target);
+            game.InstalledMods.Add(name);
         }
     }
 
@@ -204,23 +274,6 @@ public abstract class ModDownloader : IModDownloader
 
             using var p = Process.Start(psi)!;
             await p.WaitForExitAsync();
-        }
-    }
-
-    /// <summary>
-    /// Delete the Downloaded Mod Archive Files
-    /// </summary>
-    private void DeleteDownloadedModArchiveFiles()
-    {
-        if (string.IsNullOrWhiteSpace(ModDirectoryPath))
-            return;
-
-        // loop through each title_id
-        // delete archives from within title_id folder
-        var directories = Directory.GetDirectories(ModDirectoryPath);
-        foreach (var subDirectory in directories)
-        {
-            DeleteFiles(subDirectory, ".zip", ".rar", ".7z");
         }
     }
 

@@ -17,17 +17,33 @@ public partial class DownloadConfirmationWindow : Window
         LblModsDetected.IsVisible = false;
         TxtModsDetected.IsVisible = false;
 
-        // if no games, disable details button
-        var gamesWithMods = games.Where(g => g.ModDownloadUrls.Count != 0).ToList();
-        if (gamesWithMods.Count == 0)
+        // report what really happened, game by game
+        var installedGames = games.Where(g => g.InstalledMods.Count != 0).ToList();
+        LblDoneTotal.Content = $"Done! New mods installed for {installedGames.Count} of {games.Count} detected games.";
+
+        var lines = new List<string>();
+        foreach (var g in games.OrderBy(g => g.TitleName))
+        {
+            string version = string.IsNullOrEmpty(g.TitleVersion) ? "" : $" [{g.TitleVersion}]";
+            lines.Add($"{g.TitleName}{version}");
+            foreach (var m in g.InstalledMods) lines.Add($"   + installed: {m}");
+            foreach (var m in g.SkippedMods) lines.Add($"   = already there, not touched: {m}");
+            foreach (var p in g.Problems) lines.Add($"   ! {p}");
+            if (g.InstalledMods.Count == 0 && g.SkippedMods.Count == 0 && g.Problems.Count == 0)
+                lines.Add("   ! nothing downloaded");
+        }
+
+        if (lines.Count == 0)
         {
             BtnToggleDetails.IsEnabled = false;
             return;
         }
 
-        // otherwise, populate the form with the details 
-        LblDoneTotal.Content = LblDoneTotal.Content!.ToString()!.Replace("0", gamesWithMods.Count.ToString());
-        TxtModsDetected.Text = string.Join(Environment.NewLine, gamesWithMods.Select(g => g.TitleName));
+        TxtModsDetected.Text = string.Join(Environment.NewLine, lines);
+
+        // show the details straight away if anything went wrong
+        if (games.Any(g => g.Problems.Count != 0))
+            BtnToggleDetails_Click(this, new RoutedEventArgs());
     }
 
     public void BtnOK_Click(object sender, RoutedEventArgs e) => Close();
