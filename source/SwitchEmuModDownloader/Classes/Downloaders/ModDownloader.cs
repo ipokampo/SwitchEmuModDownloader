@@ -89,14 +89,23 @@ public abstract class ModDownloader : IModDownloader
                 {
                     string fileName = Uri.UnescapeDataString(url.AbsoluteUri[(url.AbsoluteUri.LastIndexOf('/') + 1)..].Trim());
                     string downloadedFilePath = Path.Combine(gameWork, fileName);
-                    string? error;
-                    await using (var file = new FileStream(downloadedFilePath, FileMode.Create, FileAccess.Write, FileShare.None, 8192, fileOptions))
+                    string? error = null;
+                    if (url.IsFile)
                     {
+                        // already on disk (e.g. taken from a downloaded repository zip)
+                        fileName = Path.GetFileName(url.LocalPath);
+                        downloadedFilePath = Path.Combine(gameWork, fileName);
+                        try { File.Copy(url.LocalPath, downloadedFilePath, true); }
+                        catch (Exception ex) { error = ex.Message; }
+                    }
+                    else
+                    {
+                        await using var file = new FileStream(downloadedFilePath, FileMode.Create, FileAccess.Write, FileShare.None, 8192, fileOptions);
                         var progressReporter = new Progress<float>(progress => OnProgressChanged((int)(progress * 100), $"Downloading {fileName} ..."));
                         error = await client.DownloadAsync(url.AbsoluteUri, file, progressReporter);
                     }
 
-                    if (error is null && new FileInfo(downloadedFilePath).Length > 0)
+                    if (error is null && File.Exists(downloadedFilePath) && new FileInfo(downloadedFilePath).Length > 0)
                     {
                         downloaded.Add(downloadedFilePath);
                     }

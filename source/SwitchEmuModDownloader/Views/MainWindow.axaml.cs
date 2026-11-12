@@ -39,20 +39,67 @@ public partial class MainWindow : Window
         // disable form controls
         ToggleUiControls(false);
 
-        // download the mods 
-        IModDownloader modDownloader = ModDownloaderFactory.Create(CboModRepos.SelectedIndex, _clientFactory!, ClearModDataLocationToolStripMenuItem.IsChecked.GetValueOrDefault(), DeleteDownloadedModArchivesToolStripMenuItem.IsChecked.GetValueOrDefault());
-        modDownloader.ProgressChanged += ModDownloader_ProgressChanged;
-        await modDownloader.DownloadPrerequisitesAsync();
-        List<Game> games = await modDownloader.ReadGameTitlesDatabaseAsync();
-        await modDownloader.DownloadModsAsync(games);
+        IModDownloader? modDownloader = null;
+        try
+        {
+            // download the mods 
+            modDownloader = ModDownloaderFactory.Create(CboModRepos.SelectedIndex, _clientFactory!, ClearModDataLocationToolStripMenuItem.IsChecked.GetValueOrDefault(), DeleteDownloadedModArchivesToolStripMenuItem.IsChecked.GetValueOrDefault());
+            modDownloader.ProgressChanged += ModDownloader_ProgressChanged;
+            await modDownloader.DownloadPrerequisitesAsync();
+            List<Game> games = await modDownloader.ReadGameTitlesDatabaseAsync();
+            await modDownloader.DownloadModsAsync(games);
+            WriteLog(games, null);
 
-        // tell user mods have been downloaded 
-        PbarProgress.ProgressTextFormat = "Done!";
-        await new DownloadConfirmationWindow(games).ShowDialog(this);
+            // tell user mods have been downloaded 
+            PbarProgress.ProgressTextFormat = "Done!";
+            await new DownloadConfirmationWindow(games).ShowDialog(this);
+        }
+        catch (Exception ex)
+        {
+            // never close silently: show the error and keep it in the log
+            string logPath = WriteLog([], ex);
+            PbarProgress.ProgressTextFormat = "Error";
+            await MessageBoxManager.GetMessageBoxStandard(new()
+            {
+                ButtonDefinitions = ButtonEnum.Ok,
+                ContentTitle = this.Title,
+                ContentMessage = $"{ex.Message}{Environment.NewLine}{Environment.NewLine}Details: {logPath}",
+                Icon = MsBox.Avalonia.Enums.Icon.Error,
+                WindowIcon = this.Icon,
+                WindowStartupLocation = WindowStartupLocation.CenterOwner
+            }).ShowWindowDialogAsync(this);
+        }
+        finally
+        {
+            // reset ui
+            if (modDownloader is not null)
+                modDownloader.ProgressChanged -= ModDownloader_ProgressChanged;
+            ToggleUiControls(true);
+        }
+    }
 
-        // reset ui
-        modDownloader.ProgressChanged -= ModDownloader_ProgressChanged;
-        ToggleUiControls(true);
+    /// <summary>
+    /// Appends what happened (per game, or the exception) to SwitchEmuModDownloader.log next to the exe.
+    /// </summary>
+    private string WriteLog(List<Game> games, Exception? ex)
+    {
+        string logPath = Path.Combine(AppContext.BaseDirectory, "SwitchEmuModDownloader.log");
+        try
+        {
+            var lines = new List<string> { "", $"===== {DateTime.Now:yyyy-MM-dd HH:mm:ss} - {CboModRepos.SelectionBoxItem} =====" };
+            foreach (var g in games.OrderBy(g => g.TitleName))
+            {
+                lines.Add($"{g.TitleName} [{g.TitleID}] [{g.TitleVersion}]");
+                lines.AddRange(g.InstalledMods.Select(m => $"   + installed: {m}"));
+                lines.AddRange(g.SkippedMods.Select(m => $"   = already there, not touched: {m}"));
+                lines.AddRange(g.Problems.Select(p => $"   ! {p}"));
+            }
+            if (ex is not null)
+                lines.Add(ex.ToString());
+            File.AppendAllLines(logPath, lines);
+        }
+        catch { }
+        return logPath;
     }
 
     //// ====================================================

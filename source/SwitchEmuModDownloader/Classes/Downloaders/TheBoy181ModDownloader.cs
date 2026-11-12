@@ -1,5 +1,6 @@
 ﻿using SwitchEmuModDownloader.Classes.Entities;
-using System.Text.Json;
+using SwitchEmuModDownloader.Classes.Extensions;
+using System.IO.Compression;
 using System.Text.RegularExpressions;
 
 namespace SwitchEmuModDownloader.Classes.Downloaders;
@@ -7,44 +8,61 @@ namespace SwitchEmuModDownloader.Classes.Downloaders;
 /// <summary>
 /// Mods from https://github.com/theboy181/switch-ptchtxt-mods
 /// Layout of the repo: "{Game Name}/[{TITLEID}]/{version}/{mod}.rar"
-/// The whole file list is read with ONE call to the GitHub API (git trees), so there is no
-/// headless browser, no HTML scraping and no fixed list of games: every game in the repo is seen.
+///
+/// The whole repository is downloaded as ONE zip (codeload.github.com, not the rate-limited
+/// GitHub API) and kept in "SwitchEmuModDownloader-cache" next to the exe. Every game the user
+/// has is then matched against it: mods for the exact installed version are installed, and
+/// games whose version has no mods are reported with the versions that do exist.
 /// </summary>
 public sealed partial class TheBoy181ModDownloader(IHttpClientFactory clientFactory, bool isModDataLocationToBeDeleted, bool isDownloadedModArchivesToBeDeleted) : ModDownloader(clientFactory, isModDataLocationToBeDeleted, isDownloadedModArchivesToBeDeleted)
 {
-    private const string Owner = "theboy181";
-    private const string Repo = "switch-ptchtxt-mods";
-    private const string Branch = "main";
+    private const string RepoZipUrl = "https://codeload.github.com/theboy181/switch-ptchtxt-mods/zip/refs/heads/main";
     private readonly IHttpClientFactory _clientFactory = clientFactory;
+    private readonly string _cacheDir = Path.Combine(AppContext.BaseDirectory, "SwitchEmuModDownloader-cache", "theboy181");
+    private string _extractDir = "";
 
+    // path inside the zip, without the "switch-ptchtxt-mods-main/" root folder
     [GeneratedRegex(@"^(?<name>[^/]+)/\[(?<id>[0-9A-Fa-f]{16})\]/(?<ver>[^/]+)/(?<file>[^/]+\.(?:zip|rar|7z))$", RegexOptions.IgnoreCase)]
     private static partial Regex ModPathRegex();
 
     public override async Task<List<Game>> ReadGameTitlesDatabaseAsync()
     {
         var games = new List<Game>();
+        string zipPath = await DownloadRepoZipAsync();
+
         OnProgressChanged(0, "Reading TheBoy181 repository ...");
 
-        // titleId -> (name, version -> [paths])
-        var repoIndex = new Dictionary<string, (string Name, Dictionary<string, List<string>> Versions)>(StringComparer.OrdinalIgnoreCase);
-        foreach (string path in await GetRepoFilePathsAsync())
+        // titleId -> (name, version -> [zip entries])
+        var repoIndex = new Dictionary<string, (string Name, Dictionary<string, List<ZipArchiveEntry>> Versions)>(StringComparer.OrdinalIgnoreCase);
+        using var zip = ZipFile.OpenRead(zipPath);
+        foreach (var entry in zip.Entries)
         {
-            var m = ModPathRegex().Match(path);
+            int slash = entry.FullName.IndexOf('/');
+            if (slash < 0)
+                continue;
+
+            var m = ModPathRegex().Match(entry.FullName[(slash + 1)..]);
             if (!m.Success)
                 continue;
 
             string id = m.Groups["id"].Value.ToUpperInvariant();
-            if (!repoIndex.TryGetValue(id, out var entry))
+            if (!repoIndex.TryGetValue(id, out var game))
             {
-                entry = (m.Groups["name"].Value, new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase));
-                repoIndex[id] = entry;
+                game = (m.Groups["name"].Value, new Dictionary<string, List<ZipArchiveEntry>>(StringComparer.OrdinalIgnoreCase));
+                repoIndex[id] = game;
             }
 
             string ver = NormalizeVersion(m.Groups["ver"].Value);   // repo uses both "4.0.0" and "v4.0.0"
-            if (!entry.Versions.TryGetValue(ver, out var list))
-                entry.Versions[ver] = list = [];
-            list.Add(path);
+            if (!game.Versions.TryGetValue(ver, out var list))
+                game.Versions[ver] = list = [];
+            list.Add(entry);
         }
+
+        // fresh folder with the archives that match this run
+        _extractDir = Path.Combine(_cacheDir, "selected");
+        if (Directory.Exists(_extractDir))
+            Directory.Delete(_extractDir, true);
+        Directory.CreateDirectory(_extractDir);
 
         // only games the user has (a folder named after the TitleID inside load/)
         if (Directory.Exists(ModDirectoryPath))
@@ -64,14 +82,24 @@ public sealed partial class TheBoy181ModDownloader(IHttpClientFactory clientFact
                     ModDataLocation = dir
                 };
 
-                if (entry.Versions.TryGetValue(titleVersion, out var paths))
+                if (entry.Versions.TryGetValue(titleVersion, out var archives))
                 {
-                    game.ModDownloadUrls = paths.Select(ToRawUrl).ToList();
+                    // patches (.pchtxt) only work on the exact build: only these are installed
+                    string gameDir = Path.Combine(_extractDir, titleId);
+                    Directory.CreateDirectory(gameDir);
+                    foreach (var archive in archives)
+                    {
+                        string target = Path.Combine(gameDir, archive.Name);
+                        archive.ExtractToFile(target, true);
+                        game.ModDownloadUrls.Add(new Uri(target));
+                    }
                 }
                 else
                 {
-                    // patches (.pchtxt) only work on the exact build, so never guess another version
-                    game.Problems.Add($"No mods for version {titleVersion} (available: {string.Join(", ", entry.Versions.Keys.OrderBy(v => v))})");
+                    string available = string.Join(", ", entry.Versions
+                        .OrderBy(v => v.Key)
+                        .Select(v => $"{v.Key} ({string.Join(", ", v.Value.Select(a => Path.GetFileNameWithoutExtension(a.Name)))})"));
+                    game.Problems.Add($"NOT INSTALLED - you have version {titleVersion}; TheBoy181 has mods only for: {available}");
                 }
 
                 games.Add(game);
@@ -82,28 +110,63 @@ public sealed partial class TheBoy181ModDownloader(IHttpClientFactory clientFact
         return games;
     }
 
-    /// <summary>
-    /// Lists every file in the repository using the GitHub git trees API (1 request).
-    /// </summary>
-    private async Task<List<string>> GetRepoFilePathsAsync()
+    public override async Task DownloadModsAsync(List<Game> games)
     {
-        using var client = _clientFactory.CreateClient("GitHub-Api");
-        string json = await client.GetStringAsync($"repos/{Owner}/{Repo}/git/trees/{Branch}?recursive=1").ConfigureAwait(false);
-        using var doc = JsonDocument.Parse(json);
+        await base.DownloadModsAsync(games);
 
-        var paths = new List<string>();
-        foreach (var item in doc.RootElement.GetProperty("tree").EnumerateArray())
+        // the zip stays in the cache folder; the per-run selection does not
+        try { Directory.Delete(_extractDir, true); } catch { }
+    }
+
+    /// <summary>
+    /// Downloads the whole repository as a zip into the cache folder (always the latest).
+    /// If the download fails, the previously cached zip is used.
+    /// </summary>
+    private async Task<string> DownloadRepoZipAsync()
+    {
+        Directory.CreateDirectory(_cacheDir);
+        string zipPath = Path.Combine(_cacheDir, "switch-ptchtxt-mods-main.zip");
+        string tmpPath = zipPath + ".part";
+
+        string? error;
+        await using (var file = new FileStream(tmpPath, FileMode.Create, FileAccess.Write, FileShare.None, 8192, FileOptions.Asynchronous | FileOptions.SequentialScan))
         {
-            if (item.GetProperty("type").GetString() == "blob")
-                paths.Add(item.GetProperty("path").GetString()!);
+            var client = _clientFactory.CreateClient();
+            client.DefaultRequestHeaders.Add("user-agent", "SwitchEmuModDownloader");
+            var progressReporter = new Progress<float>(progress => OnProgressChanged((int)(progress * 100), "Downloading TheBoy181 repository ..."));
+            OnProgressChanged(0, "Downloading TheBoy181 repository ...");
+            error = await client.DownloadAsync(RepoZipUrl, file, progressReporter);
         }
-        return paths;
+
+        if (error is null && IsValidZip(tmpPath))
+        {
+            File.Move(tmpPath, zipPath, true);
+        }
+        else
+        {
+            try { File.Delete(tmpPath); } catch { }
+            if (!File.Exists(zipPath))
+                throw new InvalidOperationException($"Could not download the TheBoy181 repository ({error ?? "invalid zip"}) and there is no cached copy.");
+            OnProgressChanged(100, "Download failed, using cached copy ...");
+        }
+
+        return zipPath;
+    }
+
+    private static bool IsValidZip(string path)
+    {
+        try
+        {
+            using var z = ZipFile.OpenRead(path);
+            return z.Entries.Count > 0;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private static string NormalizeVersion(string version) => version.Trim().TrimStart('v', 'V');
-
-    private static Uri ToRawUrl(string path) =>
-        new($"https://raw.githubusercontent.com/{Owner}/{Repo}/{Branch}/{string.Join("/", path.Split('/').Select(Uri.EscapeDataString))}");
 
     /// <summary>
     /// Gets the Title Version information from /cache/game_list/
