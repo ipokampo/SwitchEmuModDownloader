@@ -4,7 +4,7 @@
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         mc:Ignorable="d" Width="450" SizeToContent="Height"
         x:Class="SwitchEmuModDownloader.MainWindow"
-        Title="Switch Emu Mod Downloader"
+        Title="Switch Emu Mod Downloader 1.6.0 (fork ipokampo)"
         CanResize="False"
         Icon="/Assets/icon.ico"
         Loaded="Window_LoadedAsync"
